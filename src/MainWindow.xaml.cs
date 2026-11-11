@@ -1,90 +1,102 @@
-using System.Collections.ObjectModel;
+using System.ComponentModel;
 using System.Diagnostics;
 using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Input;
 using System.Windows.Media;
 
 namespace PolarWare.Checker;
 
 public partial class MainWindow : Window
 {
-    private const string WebUrl     = "https://polarware.vercel.app";
-    private const string DiscordUrl = "https://discord.gg/GZPErdvX7y";
-
-    public ObservableCollection<CheckRow> Rows { get; } = new();
+    private bool busy;
+    private string? uuid;
 
     public MainWindow()
     {
         InitializeComponent();
-        ChecksList.ItemsSource = Rows;
-        Loaded += (_, _) => OnRun(this, new RoutedEventArgs());
+        Loaded += async (_, _) =>
+        {
+            var area = SystemParameters.WorkArea;
+            var scale = Math.Min(1, Math.Min(area.Width / 900, area.Height / 620));
+            Shell.LayoutTransform = new ScaleTransform(scale, scale);
+            Width = 900 * scale;
+            Height = 620 * scale;
+            Left = area.Left + (area.Width - Width) / 2;
+            Top = area.Top + (area.Height - Height) / 2;
+            await RunAsync();
+        };
     }
 
-    private void OnRun(object sender, RoutedEventArgs e)
+    private async Task RunAsync(DiagnosticRow? package = null)
     {
-        RunBtn.IsEnabled = false;
-        Rows.Clear();
-        SummaryText.Text = "running…";
-
-        var dispatcher = Dispatcher;
-        _ = System.Threading.Tasks.Task.Run(() =>
+        if (busy) return;
+        busy = true;
+        RefreshButton.IsEnabled = RuntimeRows.IsEnabled = false;
+        Message.Text = package == null ? "Reading system status…" : $"{package.Action}: {package.Name}…";
+        string? result = null;
+        try
         {
-            var results = Checks.RunAll();
-            dispatcher.Invoke(() =>
+            if (package != null)
             {
-                foreach (var r in results) Rows.Add(CheckRow.From(r));
-                var pass = results.Count(r => r.State == CheckState.Pass);
-                var warn = results.Count(r => r.State == CheckState.Warn);
-                var fail = results.Count(r => r.State == CheckState.Fail);
-                SummaryText.Text = fail > 0
-                    ? $"{fail} fail  ·  {warn} warn  ·  {pass} pass"
-                    : warn > 0
-                        ? $"{warn} warn  ·  {pass} pass  —  ready"
-                        : $"{pass} pass  —  ready";
-                RunBtn.IsEnabled = true;
-            });
-        });
-    }
+                try { result = await Packages.ExecuteAsync(package); }
+                catch (Win32Exception e) when (e.NativeErrorCode == 1223) { result = "Operation canceled."; }
+                catch (Exception e) { result = $"Package error: {e.Message}"; }
+            }
 
-    private void OnTitleBarDrag(object sender, System.Windows.Input.MouseButtonEventArgs e)
-    {
-        if (e.ButtonState == System.Windows.Input.MouseButtonState.Pressed) DragMove();
-    }
-    private void OnMinimize(object sender, RoutedEventArgs e) => WindowState = WindowState.Minimized;
-    private void OnClose(object sender, RoutedEventArgs e) => Close();
-
-    private void OnOpenWeb(object sender, RoutedEventArgs e) => OpenUrl(WebUrl);
-    private void OnOpenDiscord(object sender, RoutedEventArgs e) => OpenUrl(DiscordUrl);
-
-    private static void OpenUrl(string url)
-    {
-        try { Process.Start(new ProcessStartInfo(url) { UseShellExecute = true }); }
-        catch { }
-    }
-}
-
-public sealed class CheckRow
-{
-    public string Name { get; init; } = "";
-    public string Detail { get; init; } = "";
-    public string Fix { get; init; } = "";
-    public string StateLabel { get; init; } = "";
-    public Brush StateBrush { get; init; } = Brushes.Gray;
-    public Visibility FixVisibility => string.IsNullOrWhiteSpace(Fix) ? Visibility.Collapsed : Visibility.Visible;
-    public CheckResult Raw { get; init; } = new("", CheckState.Unknown, "", "");
-
-    public static CheckRow From(CheckResult r)
-    {
-        var (label, brush) = r.State switch
+            var data = await Task.Run(Diagnostics.Read);
+            SystemRows.ItemsSource = data.System;
+            WindowsRows.ItemsSource = data.Windows;
+            BoosterRows.ItemsSource = data.Boosters;
+            AnticheatRows.ItemsSource = data.Anticheats;
+            RuntimeRows.ItemsSource = data.Runtimes;
+            uuid = data.Uuid;
+            HardwareValue.Text = uuid ?? "Unavailable";
+            FooterUuid.Text = $"Hardware UUID · {HardwareValue.Text}";
+            CopyButton.IsEnabled = uuid != null;
+            Message.Text = result ?? "System status updated.";
+        }
+        catch (Exception e) { Message.Text = $"Could not refresh: {e.Message}"; }
+        finally
         {
-            CheckState.Pass => ("PASS", (Brush)new SolidColorBrush(Color.FromRgb(0x22, 0xC5, 0x5E))),
-            CheckState.Warn => ("WARN", (Brush)new SolidColorBrush(Color.FromRgb(0xF5, 0x9E, 0x0B))),
-            CheckState.Fail => ("FAIL", (Brush)new SolidColorBrush(Color.FromRgb(0xEF, 0x44, 0x44))),
-            _ => ("  ?  ", (Brush)new SolidColorBrush(Color.FromRgb(0x8A, 0x95, 0xA8))),
-        };
-        return new CheckRow
+            busy = false;
+            RefreshButton.IsEnabled = RuntimeRows.IsEnabled = true;
+        }
+    }
+
+    private async void RefreshClicked(object sender, RoutedEventArgs e) => await RunAsync();
+
+    private async void RunPackage(object sender, RoutedEventArgs e)
+    {
+        if (busy || sender is not Button { DataContext: DiagnosticRow row }) return;
+        if (row.Action == "Uninstall" &&
+            MessageBox.Show(this, $"Uninstall {row.Name}? Other applications may depend on it.",
+                Title, MessageBoxButton.OKCancel, MessageBoxImage.Warning) != MessageBoxResult.OK) return;
+        await RunAsync(row);
+    }
+
+    private void CopyUuid(object sender, RoutedEventArgs e)
+    {
+        if (uuid == null) return;
+        try
         {
-            Name = r.Name, Detail = r.Detail, Fix = r.FixHint,
-            StateLabel = label, StateBrush = brush, Raw = r,
-        };
+            Clipboard.SetText(uuid);
+            Message.Text = "Hardware UUID copied.";
+        }
+        catch (System.Runtime.InteropServices.ExternalException) { Message.Text = "Clipboard unavailable. Try again."; }
+    }
+
+    private void DragTitle(object sender, MouseButtonEventArgs e)
+    {
+        if (e.LeftButton == MouseButtonState.Pressed) DragMove();
+    }
+    private void MinimizeWindow(object sender, RoutedEventArgs e) => WindowState = WindowState.Minimized;
+    private void CloseWindow(object sender, RoutedEventArgs e) => Close();
+    private void OpenSecurity(object sender, RoutedEventArgs e) => OpenSettings("windowsdefender:");
+    private void OpenApps(object sender, RoutedEventArgs e) => OpenSettings("ms-settings:appsfeatures");
+    private void OpenSettings(string uri)
+    {
+        try { Process.Start(new ProcessStartInfo(uri) { UseShellExecute = true }); }
+        catch (Win32Exception e) { Message.Text = $"Could not open settings: {e.Message}"; }
     }
 }
